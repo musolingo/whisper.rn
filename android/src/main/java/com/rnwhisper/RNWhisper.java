@@ -151,6 +151,8 @@ public class RNWhisper implements LifecycleEventListener {
     return task;
   }
 
+  private static final String WAV_BASE64_PREFIX = "data:audio/wav;base64,";
+
   public void transcribeFile(double id, double jobId, String filePathOrBase64, ReadableMap options, Promise promise) {
     final WhisperContext context = contexts.get((int) id);
     if (context == null) {
@@ -176,8 +178,9 @@ public class RNWhisper implements LifecycleEventListener {
       int resId = getResourceIdentifier(waveFilePath);
       if (resId > 0) {
         audioData = AudioUtils.decodeWaveFile(reactContext.getResources().openRawResource(resId));
-      } else if (filePathOrBase64.startsWith("data:audio/wav;base64,")) {
-        audioData = AudioUtils.decodeWaveData(filePathOrBase64);
+      } else if (filePathOrBase64.startsWith(WAV_BASE64_PREFIX)) {
+        String base64Payload = filePathOrBase64.substring(WAV_BASE64_PREFIX.length());
+        audioData = AudioUtils.decodeWaveData(base64Payload);
       } else {
         audioData = AudioUtils.decodeWaveFile(new FileInputStream(new File(waveFilePath)));
       }

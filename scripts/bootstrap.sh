@@ -1,6 +1,7 @@
 #!/bin/bash -e
 
 git submodule init
+
 git submodule update --recursive
 
 cp ./whisper.cpp/ggml/include/ggml.h ./cpp/ggml.h

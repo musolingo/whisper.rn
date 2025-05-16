@@ -60,9 +60,6 @@ buck-out/
 android/app/libs
 android/keystores/debug.keystore
 
-# Expo
-.expo/
-
 # Turborepo
 .turbo/
 
@@ -73,3 +70,8 @@ docs/API/.nojekyll
 
 *.metallib
 .xocde.env.local
+
+# Compiled Typescript files
+src/**/*.js
+example/**/*.js
+

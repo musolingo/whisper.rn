@@ -1,8 +1,11 @@
 #!/bin/bash -e
 
-git submodule init
-
-git submodule update --recursive
+if [ -d .git ]; then
+  git submodule init
+  git submodule update --recursive
+else
+  echo "Skipping git submodule setup - repository metadata not found."
+fi
 
 cp ./whisper.cpp/ggml/include/ggml.h ./cpp/ggml.h
 cp ./whisper.cpp/ggml/include/ggml-alloc.h ./cpp/ggml-alloc.h
@@ -136,7 +139,11 @@ cd whisper.cpp/bindings/javascript
 node -e "const fs = require('fs'); const package = JSON.parse(fs.readFileSync('package.json')); fs.writeFileSync('../../../src/version.json', JSON.stringify({version: package.version}));"
 cd ../../../
 
-yarn example
+if [ "$WHISPER_RN_SKIP_EXAMPLE" = "true" ]; then
+  echo "Skipping Whisper example dependency installation."
+else
+  yarn example
+fi
 
 # Apply patch
 patch -p0 -d ./cpp < ./scripts/patches/ggml-metal.m.patch
@@ -162,40 +169,42 @@ if [ "$OS" = "Darwin" ]; then
   cd -
 fi
 
-# Download model for example
-cd whisper.cpp/models
+if [ "$WHISPER_RN_SKIP_EXAMPLE" != "true" ]; then
+  # Download model for example
+  cd whisper.cpp/models
 
-# If CI env is `true`, use dummy model
-if [ "$CI" = "true" ]; then
-  cp for-tests-ggml-base.bin ggml-base.bin
-  echo "CI: Copied for-tests-ggml-base.bin to ggml-base.bin"
-else
-  ./download-ggml-model.sh base
-fi
-
-# Copy to assets
-cp ../samples/jfk.wav ../../example/assets
-cp ggml-base.bin ../../example/assets
-echo "Copied ggml-base.bin to example/assets"
-
-# Check whisper.cpp/models/ggml-base-encoder.mlmodelc exist
-if [ ! -d ./ggml-base-encoder.mlmodelc ]; then
-  URL=https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base-encoder.mlmodelc.zip
-  FILE=ggml-base-encoder.mlmodelc.zip
-
-  if [ -x "$(command -v wget)" ]; then
-    wget --no-config --quiet --show-progress -O $FILE $URL
-  elif [ -x "$(command -v curl)" ]; then
-    curl -L --output $FILE $URL
+  # If CI env indicates a non-interactive build, use dummy model
+  if [ "$CI" = "true" ] || [ "$CI" = "1" ]; then
+    cp for-tests-ggml-base.bin ggml-base.bin
+    echo "CI: Copied for-tests-ggml-base.bin to ggml-base.bin"
   else
-    printf "Either wget or curl is required to download models.\n"
-    exit 1
+    ./download-ggml-model.sh base
   fi
 
-  unzip $FILE
-  rm $FILE
-fi
+  # Copy to assets
+  cp ../samples/jfk.wav ../../example/assets
+  cp ggml-base.bin ../../example/assets
+  echo "Copied ggml-base.bin to example/assets"
 
-if [ ! -d ../../example/assets/ggml-base-encoder.mlmodelc ]; then
-  cp -r ./ggml-base-encoder.mlmodelc ../../example/assets/
+  # Check whisper.cpp/models/ggml-base-encoder.mlmodelc exist
+  if [ ! -d ./ggml-base-encoder.mlmodelc ]; then
+    URL=https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base-encoder.mlmodelc.zip
+    FILE=ggml-base-encoder.mlmodelc.zip
+
+    if [ -x "$(command -v wget)" ]; then
+      wget --no-config --quiet --show-progress -O $FILE $URL
+    elif [ -x "$(command -v curl)" ]; then
+      curl -L --output $FILE $URL
+    else
+      printf "Either wget or curl is required to download models.\n"
+      exit 1
+    fi
+
+    unzip $FILE
+    rm $FILE
+  fi
+
+  if [ ! -d ../../example/assets/ggml-base-encoder.mlmodelc ]; then
+    cp -r ./ggml-base-encoder.mlmodelc ../../example/assets/
+  fi
 fi

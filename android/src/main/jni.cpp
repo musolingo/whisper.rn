@@ -2,532 +2,718 @@
 #include <android/asset_manager.h>
 #include <android/asset_manager_jni.h>
 #include <android/log.h>
-#include <cstdlib>
-#include <sys/sysinfo.h>
+#include <fbjni/fbjni.h>
+#include <ReactCommon/CallInvokerHolder.h>
+
+#include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <string>
-#include <thread>
 #include <vector>
+
 #include "whisper.h"
 #include "rn-whisper.h"
-#include "ggml.h"
-#include "jni-utils.h"
+#include "RNWhisperJSI.h"
 
-#define UNUSED(x) (void)(x)
-#define TAG "JNI"
+namespace {
 
-#define LOGI(...) __android_log_print(ANDROID_LOG_INFO,     TAG, __VA_ARGS__)
-#define LOGW(...) __android_log_print(ANDROID_LOG_WARN,     TAG, __VA_ARGS__)
+JavaVM *g_javaVm = nullptr;
+jobject g_applicationContext = nullptr;
+jobject g_assetManager = nullptr;
 
-static inline int min(int a, int b) {
-    return (a < b) ? a : b;
+constexpr const char *kTag = "RNWhisperJNI";
+
+bool isRemoteUrl(const std::string &path) {
+    return path.rfind("http://", 0) == 0 || path.rfind("https://", 0) == 0;
 }
 
-// Load model from input stream (used for drawable / raw resources)
+std::string stripAssetPrefix(const std::string &path) {
+    static const std::string assetPrefix = "asset:/";
+    static const std::string androidAssetPrefix = "/android_asset/";
+    static const std::string fileAndroidAssetPrefix = "file:///android_asset/";
+
+    if (path.rfind(assetPrefix, 0) == 0) {
+        return path.substr(assetPrefix.size());
+    }
+    if (path.rfind(fileAndroidAssetPrefix, 0) == 0) {
+        return path.substr(fileAndroidAssetPrefix.size());
+    }
+    if (path.rfind(androidAssetPrefix, 0) == 0) {
+        return path.substr(androidAssetPrefix.size());
+    }
+    return path;
+}
+
+bool isAssetPath(const std::string &path) {
+    return path.rfind("asset:/", 0) == 0 ||
+           path.rfind("file:///android_asset/", 0) == 0 ||
+           path.rfind("/android_asset/", 0) == 0;
+}
+
+std::string toStdString(JNIEnv *env, jstring value) {
+    if (!value) {
+        return {};
+    }
+    const char *chars = env->GetStringUTFChars(value, nullptr);
+    std::string stringValue = chars ? std::string(chars) : std::string();
+    if (chars) {
+        env->ReleaseStringUTFChars(value, chars);
+    }
+    return stringValue;
+}
+
+jobject getApplicationContext() {
+    return g_applicationContext;
+}
+
+jobject getAssetManager() {
+    return g_assetManager;
+}
+
+JNIEnv *getEnv(bool *needsDetach = nullptr) {
+    if (needsDetach) {
+        *needsDetach = false;
+    }
+    if (!g_javaVm) {
+        return nullptr;
+    }
+
+    JNIEnv *env = nullptr;
+    jint status = g_javaVm->GetEnv(reinterpret_cast<void **>(&env), JNI_VERSION_1_6);
+    if (status == JNI_OK) {
+        return env;
+    }
+    if (status == JNI_EDETACHED) {
+        if (g_javaVm->AttachCurrentThread(&env, nullptr) == JNI_OK) {
+            if (needsDetach) {
+                *needsDetach = true;
+            }
+            return env;
+        }
+    }
+    return nullptr;
+}
+
+void detachThreadIfNeeded(bool needsDetach) {
+    if (needsDetach && g_javaVm) {
+        g_javaVm->DetachCurrentThread();
+    }
+}
+
+std::vector<uint8_t> readAllBytesFromInputStream(JNIEnv *env, jobject inputStream) {
+    std::vector<uint8_t> bytes;
+    if (!env || !inputStream) {
+        return bytes;
+    }
+
+    jclass inputStreamClass = env->GetObjectClass(inputStream);
+    jmethodID readMethod = env->GetMethodID(inputStreamClass, "read", "([B)I");
+    jmethodID closeMethod = env->GetMethodID(inputStreamClass, "close", "()V");
+    jbyteArray buffer = env->NewByteArray(8192);
+
+    while (true) {
+        jint read = env->CallIntMethod(inputStream, readMethod, buffer);
+        if (read <= 0) {
+            break;
+        }
+        size_t start = bytes.size();
+        bytes.resize(start + static_cast<size_t>(read));
+        env->GetByteArrayRegion(
+            buffer,
+            0,
+            read,
+            reinterpret_cast<jbyte *>(bytes.data() + start));
+    }
+
+    env->CallVoidMethod(inputStream, closeMethod);
+    env->DeleteLocalRef(buffer);
+    env->DeleteLocalRef(inputStreamClass);
+    return bytes;
+}
+
 struct input_stream_context {
     JNIEnv *env;
     jobject input_stream;
 };
 
-static size_t input_stream_read(void *ctx, void *output, size_t read_size) {
-    input_stream_context *context = (input_stream_context *)ctx;
+size_t inputStreamRead(void *ctx, void *output, size_t readSize) {
+    auto *context = static_cast<input_stream_context *>(ctx);
     JNIEnv *env = context->env;
-    jobject input_stream = context->input_stream;
-    jclass input_stream_class = env->GetObjectClass(input_stream);
+    jobject inputStream = context->input_stream;
+    jclass inputStreamClass = env->GetObjectClass(inputStream);
 
-    jbyteArray buffer = env->NewByteArray(read_size);
-    jint bytes_read = env->CallIntMethod(
-        input_stream,
-        env->GetMethodID(input_stream_class, "read", "([B)I"),
-        buffer
-    );
+    jbyteArray buffer = env->NewByteArray(static_cast<jsize>(readSize));
+    jint bytesRead = env->CallIntMethod(
+        inputStream,
+        env->GetMethodID(inputStreamClass, "read", "([B)I"),
+        buffer);
 
-    if (bytes_read > 0) {
-        env->GetByteArrayRegion(buffer, 0, bytes_read, (jbyte *) output);
-    }
-
-    env->DeleteLocalRef(buffer);
-
-    return bytes_read;
-}
-
-static bool input_stream_is_eof(void *ctx) {
-    input_stream_context *context = (input_stream_context *)ctx;
-    JNIEnv *env = context->env;
-    jobject input_stream = context->input_stream;
-
-    jclass input_stream_class = env->GetObjectClass(input_stream);
-
-    jbyteArray buffer = env->NewByteArray(1);
-    jint bytes_read = env->CallIntMethod(
-        input_stream,
-        env->GetMethodID(input_stream_class, "read", "([B)I"),
-        buffer
-    );
-
-    bool is_eof = (bytes_read == -1);
-    if (!is_eof) {
-        // If we successfully read a byte, "unread" it by pushing it back into the stream.
-        env->CallVoidMethod(
-            input_stream,
-            env->GetMethodID(input_stream_class, "unread", "([BII)V"),
+    if (bytesRead > 0) {
+        env->GetByteArrayRegion(
             buffer,
             0,
-            1
-        );
+            bytesRead,
+            reinterpret_cast<jbyte *>(output));
     }
 
     env->DeleteLocalRef(buffer);
-
-    return is_eof;
+    env->DeleteLocalRef(inputStreamClass);
+    return bytesRead > 0 ? static_cast<size_t>(bytesRead) : 0;
 }
 
-static void input_stream_close(void *ctx) {
-    input_stream_context *context = (input_stream_context *)ctx;
+bool inputStreamIsEof(void *ctx) {
+    auto *context = static_cast<input_stream_context *>(ctx);
     JNIEnv *env = context->env;
-    jobject input_stream = context->input_stream;
-    jclass input_stream_class = env->GetObjectClass(input_stream);
+    jobject inputStream = context->input_stream;
+    jclass inputStreamClass = env->GetObjectClass(inputStream);
 
-    env->CallVoidMethod(
-        input_stream,
-        env->GetMethodID(input_stream_class, "close", "()V")
-    );
+    jbyteArray buffer = env->NewByteArray(1);
+    jint bytesRead = env->CallIntMethod(
+        inputStream,
+        env->GetMethodID(inputStreamClass, "read", "([B)I"),
+        buffer);
 
-    env->DeleteGlobalRef(input_stream);
+    bool isEof = bytesRead == -1;
+    if (!isEof) {
+        env->CallVoidMethod(
+            inputStream,
+            env->GetMethodID(inputStreamClass, "unread", "([BII)V"),
+            buffer,
+            0,
+            1);
+    }
+
+    env->DeleteLocalRef(buffer);
+    env->DeleteLocalRef(inputStreamClass);
+    return isEof;
 }
 
-static struct whisper_context *whisper_init_from_input_stream(
+void inputStreamClose(void *ctx) {
+    auto *context = static_cast<input_stream_context *>(ctx);
+    JNIEnv *env = context->env;
+    jobject inputStream = context->input_stream;
+    jclass inputStreamClass = env->GetObjectClass(inputStream);
+    env->CallVoidMethod(
+        inputStream,
+        env->GetMethodID(inputStreamClass, "close", "()V"));
+    env->DeleteLocalRef(inputStreamClass);
+    env->DeleteGlobalRef(inputStream);
+    delete context;
+}
+
+whisper_context *whisperInitFromInputStream(
     JNIEnv *env,
-    jobject input_stream, // PushbackInputStream
-    struct whisper_context_params cparams
-) {
-    input_stream_context *context = new input_stream_context;
+    jobject inputStream,
+    whisper_context_params params) {
+    auto *context = new input_stream_context;
     context->env = env;
-    context->input_stream = env->NewGlobalRef(input_stream);
+    context->input_stream = env->NewGlobalRef(inputStream);
 
     whisper_model_loader loader = {
         .context = context,
-        .read = &input_stream_read,
-        .eof = &input_stream_is_eof,
-        .close = &input_stream_close
+        .read = &inputStreamRead,
+        .eof = &inputStreamIsEof,
+        .close = &inputStreamClose,
     };
-    return whisper_init_with_params(&loader, cparams);
+    return whisper_init_with_params(&loader, params);
 }
 
-// Load model from asset
-static size_t asset_read(void *ctx, void *output, size_t read_size) {
-    return AAsset_read((AAsset *) ctx, output, read_size);
+whisper_vad_context *whisperVadInitFromInputStream(
+    JNIEnv *env,
+    jobject inputStream,
+    whisper_vad_context_params params) {
+    auto *context = new input_stream_context;
+    context->env = env;
+    context->input_stream = env->NewGlobalRef(inputStream);
+
+    whisper_model_loader loader = {
+        .context = context,
+        .read = &inputStreamRead,
+        .eof = &inputStreamIsEof,
+        .close = &inputStreamClose,
+    };
+    return whisper_vad_init_with_params(&loader, params);
 }
 
-static bool asset_is_eof(void *ctx) {
-    return AAsset_getRemainingLength64((AAsset *) ctx) <= 0;
+size_t assetRead(void *ctx, void *output, size_t readSize) {
+    return AAsset_read(static_cast<AAsset *>(ctx), output, readSize);
 }
 
-static void asset_close(void *ctx) {
-    AAsset_close((AAsset *) ctx);
+bool assetIsEof(void *ctx) {
+    return AAsset_getRemainingLength64(static_cast<AAsset *>(ctx)) <= 0;
 }
 
-static struct whisper_context *whisper_init_from_asset(
+void assetClose(void *ctx) {
+    AAsset_close(static_cast<AAsset *>(ctx));
+}
+
+whisper_context *whisperInitFromAsset(
     JNIEnv *env,
     jobject assetManager,
-    const char *asset_path,
-    struct whisper_context_params cparams
-) {
-    LOGI("Loading model from asset '%s'\n", asset_path);
-    AAssetManager *asset_manager = AAssetManager_fromJava(env, assetManager);
-    AAsset *asset = AAssetManager_open(asset_manager, asset_path, AASSET_MODE_STREAMING);
+    const std::string &assetPath,
+    whisper_context_params params) {
+    auto *manager = AAssetManager_fromJava(env, assetManager);
+    AAsset *asset = AAssetManager_open(manager, assetPath.c_str(), AASSET_MODE_STREAMING);
     if (!asset) {
-        LOGW("Failed to open '%s'\n", asset_path);
-        return NULL;
+        __android_log_print(ANDROID_LOG_WARN, kTag, "Failed to open asset %s", assetPath.c_str());
+        return nullptr;
     }
+
     whisper_model_loader loader = {
         .context = asset,
-        .read = &asset_read,
-        .eof = &asset_is_eof,
-        .close = &asset_close
+        .read = &assetRead,
+        .eof = &assetIsEof,
+        .close = &assetClose,
     };
-    return whisper_init_with_params(&loader, cparams);
+    return whisper_init_with_params(&loader, params);
 }
 
-extern "C" {
-
-JNIEXPORT jlong JNICALL
-Java_com_rnwhisper_WhisperContext_initContext(
-        JNIEnv *env, jobject thiz, jstring model_path_str) {
-    UNUSED(thiz);
-    struct whisper_context_params cparams;
-
-    // TODO: Expose dtw_token_timestamps and dtw_aheads_preset
-    cparams.dtw_token_timestamps = false;
-    // cparams.dtw_aheads_preset = WHISPER_AHEADS_BASE;
-
-    struct whisper_context *context = nullptr;
-    const char *model_path_chars = env->GetStringUTFChars(model_path_str, nullptr);
-    context = whisper_init_from_file_with_params(model_path_chars, cparams);
-    env->ReleaseStringUTFChars(model_path_str, model_path_chars);
-    return reinterpret_cast<jlong>(context);
-}
-
-JNIEXPORT jlong JNICALL
-Java_com_rnwhisper_WhisperContext_initContextWithAsset(
+whisper_vad_context *whisperVadInitFromAsset(
     JNIEnv *env,
-    jobject thiz,
-    jobject asset_manager,
-    jstring model_path_str
-) {
-    UNUSED(thiz);
-    struct whisper_context_params cparams;
-
-    // TODO: Expose dtw_token_timestamps and dtw_aheads_preset
-    cparams.dtw_token_timestamps = false;
-    // cparams.dtw_aheads_preset = WHISPER_AHEADS_BASE;
-
-    struct whisper_context *context = nullptr;
-    const char *model_path_chars = env->GetStringUTFChars(model_path_str, nullptr);
-    context = whisper_init_from_asset(env, asset_manager, model_path_chars, cparams);
-    env->ReleaseStringUTFChars(model_path_str, model_path_chars);
-    return reinterpret_cast<jlong>(context);
-}
-
-JNIEXPORT jlong JNICALL
-Java_com_rnwhisper_WhisperContext_initContextWithInputStream(
-    JNIEnv *env,
-    jobject thiz,
-    jobject input_stream
-) {
-    UNUSED(thiz);
-    struct whisper_context_params cparams;
-
-    // TODO: Expose dtw_token_timestamps and dtw_aheads_preset
-    cparams.dtw_token_timestamps = false;
-    // cparams.dtw_aheads_preset = WHISPER_AHEADS_BASE;
-
-    struct whisper_context *context = nullptr;
-    context = whisper_init_from_input_stream(env, input_stream, cparams);
-    return reinterpret_cast<jlong>(context);
-}
-
-
-struct whisper_full_params createFullParams(JNIEnv *env, jobject options) {
-    struct whisper_full_params params = whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
-
-    params.print_realtime = false;
-    params.print_progress = false;
-    params.print_timestamps = false;
-    params.print_special = false;
-
-    int max_threads = std::thread::hardware_concurrency();
-    // Use 2 threads by default on 4-core devices, 4 threads on more cores
-    int default_n_threads = max_threads == 4 ? 2 : min(4, max_threads);
-    int n_threads = readablemap::getInt(env, options, "maxThreads", default_n_threads);
-    params.n_threads = n_threads > 0 ? n_threads : default_n_threads;
-    params.translate = readablemap::getBool(env, options, "translate", false);
-    params.token_timestamps = readablemap::getBool(env, options, "tokenTimestamps", false);
-    params.tdrz_enable = readablemap::getBool(env, options, "tdrzEnable", false);
-    params.offset_ms = 0;
-    params.no_context = true;
-    params.single_segment = false;
-
-    int beam_size = readablemap::getInt(env, options, "beamSize", -1);
-    if (beam_size > -1) {
-        params.strategy = WHISPER_SAMPLING_BEAM_SEARCH;
-        params.beam_search.beam_size = beam_size;
-    }
-    int best_of = readablemap::getInt(env, options, "bestOf", -1);
-    if (best_of > -1) params.greedy.best_of = best_of;
-    int max_len = readablemap::getInt(env, options, "maxLen", -1);
-    if (max_len > -1) params.max_len = max_len;
-    int max_context = readablemap::getInt(env, options, "maxContext", -1);
-    if (max_context > -1) params.n_max_text_ctx = max_context;
-    int offset = readablemap::getInt(env, options, "offset", -1);
-    if (offset > -1) params.offset_ms = offset;
-    int duration = readablemap::getInt(env, options, "duration", -1);
-    if (duration > -1) params.duration_ms = duration;
-    int word_thold = readablemap::getInt(env, options, "wordThold", -1);
-    if (word_thold > -1) params.thold_pt = word_thold;
-    float temperature = readablemap::getFloat(env, options, "temperature", -1);
-    if (temperature > -1) params.temperature = temperature;
-    float temperature_inc = readablemap::getFloat(env, options, "temperatureInc", -1);
-    if (temperature_inc > -1) params.temperature_inc = temperature_inc;
-    jstring prompt = readablemap::getString(env, options, "prompt", nullptr);
-    if (prompt != nullptr) {
-        params.initial_prompt = env->GetStringUTFChars(prompt, nullptr);
-        env->DeleteLocalRef(prompt);
-    }
-    jstring language = readablemap::getString(env, options, "language", nullptr);
-    if (language != nullptr) {
-        params.language = env->GetStringUTFChars(language, nullptr);
-        env->DeleteLocalRef(language);
-    }
-    return params;
-}
-
-struct callback_context {
-    JNIEnv *env;
-    jobject callback_instance;
-};
-
-JNIEXPORT jint JNICALL
-Java_com_rnwhisper_WhisperContext_fullWithNewJob(
-    JNIEnv *env,
-    jobject thiz,
-    jint job_id,
-    jlong context_ptr,
-    jfloatArray audio_data,
-    jint audio_data_len,
-    jobject options,
-    jobject callback_instance
-) {
-    UNUSED(thiz);
-    struct whisper_context *context = reinterpret_cast<struct whisper_context *>(context_ptr);
-    jfloat *audio_data_arr = env->GetFloatArrayElements(audio_data, nullptr);
-
-    LOGI("About to create params");
-
-    whisper_full_params params = createFullParams(env, options);
-
-    if (callback_instance != nullptr) {
-        callback_context *cb_ctx = new callback_context;
-        cb_ctx->env = env;
-        cb_ctx->callback_instance = env->NewGlobalRef(callback_instance);
-
-        params.progress_callback = [](struct whisper_context * /*ctx*/, struct whisper_state * /*state*/, int progress, void * user_data) {
-            callback_context *cb_ctx = (callback_context *)user_data;
-            JNIEnv *env = cb_ctx->env;
-            jobject callback_instance = cb_ctx->callback_instance;
-            jclass callback_class = env->GetObjectClass(callback_instance);
-            jmethodID onProgress = env->GetMethodID(callback_class, "onProgress", "(I)V");
-            env->CallVoidMethod(callback_instance, onProgress, progress);
-        };
-        params.progress_callback_user_data = cb_ctx;
-
-        params.new_segment_callback = [](struct whisper_context * /*ctx*/, struct whisper_state * /*state*/, int n_new, void * user_data) {
-            callback_context *cb_ctx = (callback_context *)user_data;
-            JNIEnv *env = cb_ctx->env;
-            jobject callback_instance = cb_ctx->callback_instance;
-            jclass callback_class = env->GetObjectClass(callback_instance);
-            jmethodID onNewSegments = env->GetMethodID(callback_class, "onNewSegments", "(I)V");
-            env->CallVoidMethod(callback_instance, onNewSegments, n_new);
-        };
-        params.new_segment_callback_user_data = cb_ctx;
+    jobject assetManager,
+    const std::string &assetPath,
+    whisper_vad_context_params params) {
+    auto *manager = AAssetManager_fromJava(env, assetManager);
+    AAsset *asset = AAssetManager_open(manager, assetPath.c_str(), AASSET_MODE_STREAMING);
+    if (!asset) {
+        __android_log_print(ANDROID_LOG_WARN, kTag, "Failed to open VAD asset %s", assetPath.c_str());
+        return nullptr;
     }
 
-    rnwhisper::job* job = rnwhisper::job_new(job_id, params);
+    whisper_model_loader loader = {
+        .context = asset,
+        .read = &assetRead,
+        .eof = &assetIsEof,
+        .close = &assetClose,
+    };
+    return whisper_vad_init_with_params(&loader, params);
+}
 
-    LOGI("About to reset timings");
-    whisper_reset_timings(context);
-
-    LOGI("About to run whisper_full");
-    int code = whisper_full(context, params, audio_data_arr, audio_data_len);
-    if (code == 0) {
-        // whisper_print_timings(context);
+jobject openPushbackInputStreamForResource(JNIEnv *env, int resourceId) {
+    jobject context = getApplicationContext();
+    if (!context || resourceId == 0) {
+        return nullptr;
     }
-    env->ReleaseFloatArrayElements(audio_data, audio_data_arr, JNI_ABORT);
 
-    if (job->is_aborted()) code = -999;
-    rnwhisper::job_remove(job_id);
-    return code;
-}
-
-JNIEXPORT void JNICALL
-Java_com_rnwhisper_WhisperContext_createRealtimeTranscribeJob(
-    JNIEnv *env,
-    jobject thiz,
-    jint job_id,
-    jlong context_ptr,
-    jobject options
-) {
-    whisper_full_params params = createFullParams(env, options);
-    rnwhisper::job* job = rnwhisper::job_new(job_id, params);
-    rnwhisper::vad_params vad;
-    vad.use_vad = readablemap::getBool(env, options, "useVad", false);
-    vad.vad_ms = readablemap::getInt(env, options, "vadMs", 2000);
-    vad.vad_thold = readablemap::getFloat(env, options, "vadThold", 0.6f);
-    vad.freq_thold = readablemap::getFloat(env, options, "vadFreqThold", 100.0f);
-
-    jstring audio_output_path = readablemap::getString(env, options, "audioOutputPath", nullptr);
-    const char* audio_output_path_str = nullptr;
-    if (audio_output_path != nullptr) {
-        audio_output_path_str = env->GetStringUTFChars(audio_output_path, nullptr);
-        env->DeleteLocalRef(audio_output_path);
+    jclass contextClass = env->GetObjectClass(context);
+    jobject resources = env->CallObjectMethod(
+        context,
+        env->GetMethodID(contextClass, "getResources", "()Landroid/content/res/Resources;"));
+    env->DeleteLocalRef(contextClass);
+    if (!resources) {
+        return nullptr;
     }
-    job->set_realtime_params(
-        vad,
-        readablemap::getInt(env, options, "realtimeAudioSec", 0),
-        readablemap::getInt(env, options, "realtimeAudioSliceSec", 0),
-        readablemap::getFloat(env, options, "realtimeAudioMinSec", 0),
-        audio_output_path_str
-    );
-}
 
-JNIEXPORT void JNICALL
-Java_com_rnwhisper_WhisperContext_finishRealtimeTranscribeJob(
-    JNIEnv *env,
-    jobject thiz,
-    jint job_id,
-    jlong context_ptr,
-    jintArray slice_n_samples
-) {
-    UNUSED(env);
-    UNUSED(thiz);
-    UNUSED(context_ptr);
-
-    rnwhisper::job *job = rnwhisper::job_get(job_id);
-    if (job->audio_output_path != nullptr) {
-        RNWHISPER_LOG_INFO("job->params.language: %s\n", job->params.language);
-        std::vector<int> slice_n_samples_vec;
-        jint *slice_n_samples_arr = env->GetIntArrayElements(slice_n_samples, nullptr);
-        slice_n_samples_vec = std::vector<int>(slice_n_samples_arr, slice_n_samples_arr + env->GetArrayLength(slice_n_samples));
-        env->ReleaseIntArrayElements(slice_n_samples, slice_n_samples_arr, JNI_ABORT);
-
-        // TODO: Append in real time so we don't need to keep all slices & also reduce memory usage
-        rnaudioutils::save_wav_file(
-            rnaudioutils::concat_short_buffers(job->pcm_slices, slice_n_samples_vec),
-            job->audio_output_path
-        );
+    jclass resourcesClass = env->GetObjectClass(resources);
+    jobject inputStream = env->CallObjectMethod(
+        resources,
+        env->GetMethodID(resourcesClass, "openRawResource", "(I)Ljava/io/InputStream;"),
+        resourceId);
+    env->DeleteLocalRef(resourcesClass);
+    env->DeleteLocalRef(resources);
+    if (!inputStream) {
+        return nullptr;
     }
-    rnwhisper::job_remove(job_id);
+
+    jclass pushbackClass = env->FindClass("java/io/PushbackInputStream");
+    jobject pushbackStream = env->NewObject(
+        pushbackClass,
+        env->GetMethodID(pushbackClass, "<init>", "(Ljava/io/InputStream;)V"),
+        inputStream);
+    env->DeleteLocalRef(pushbackClass);
+    env->DeleteLocalRef(inputStream);
+    return pushbackStream;
 }
 
-JNIEXPORT jboolean JNICALL
-Java_com_rnwhisper_WhisperContext_vadSimple(
-    JNIEnv *env,
-    jobject thiz,
-    jint job_id,
-    jint slice_index,
-    jint n_samples,
-    jint n
-) {
-    UNUSED(thiz);
-    rnwhisper::job* job = rnwhisper::job_get(job_id);
-    return job->vad_simple(slice_index, n_samples, n);
-}
-
-JNIEXPORT void JNICALL
-Java_com_rnwhisper_WhisperContext_putPcmData(
-    JNIEnv *env,
-    jobject thiz,
-    jint job_id,
-    jshortArray pcm,
-    jint slice_index,
-    jint n_samples,
-    jint n
-) {
-    UNUSED(thiz);
-    rnwhisper::job* job = rnwhisper::job_get(job_id);
-    jshort *pcm_arr = env->GetShortArrayElements(pcm, nullptr);
-    job->put_pcm_data(pcm_arr, slice_index, n_samples, n);
-    env->ReleaseShortArrayElements(pcm, pcm_arr, JNI_ABORT);
-}
-
-JNIEXPORT jint JNICALL
-Java_com_rnwhisper_WhisperContext_fullWithJob(
-    JNIEnv *env,
-    jobject thiz,
-    jint job_id,
-    jlong context_ptr,
-    jint slice_index,
-    jint n_samples
-) {
-    UNUSED(thiz);
-    struct whisper_context *context = reinterpret_cast<struct whisper_context *>(context_ptr);
-
-    rnwhisper::job* job = rnwhisper::job_get(job_id);
-    float* pcmf32 = job->pcm_slice_to_f32(slice_index, n_samples);
-    int code = whisper_full(context, job->params, pcmf32, n_samples);
-    free(pcmf32);
-    if (code == 0) {
-        // whisper_print_timings(context);
+std::string getCacheDirectory(JNIEnv *env) {
+    jobject context = getApplicationContext();
+    if (!context) {
+        return {};
     }
-    if (job->is_aborted()) code = -999;
-    return code;
+
+    jclass contextClass = env->GetObjectClass(context);
+    jobject cacheDir = env->CallObjectMethod(
+        context,
+        env->GetMethodID(contextClass, "getCacheDir", "()Ljava/io/File;"));
+    env->DeleteLocalRef(contextClass);
+    if (!cacheDir) {
+        return {};
+    }
+
+    jclass fileClass = env->GetObjectClass(cacheDir);
+    jstring absolutePath = static_cast<jstring>(env->CallObjectMethod(
+        cacheDir,
+        env->GetMethodID(fileClass, "getAbsolutePath", "()Ljava/lang/String;")));
+    std::string path = toStdString(env, absolutePath);
+    env->DeleteLocalRef(absolutePath);
+    env->DeleteLocalRef(fileClass);
+    env->DeleteLocalRef(cacheDir);
+    return path;
 }
 
-JNIEXPORT void JNICALL
-Java_com_rnwhisper_WhisperContext_abortTranscribe(
+std::string getCacheRoot(JNIEnv *env) {
+    std::string cacheDir = getCacheDirectory(env);
+    if (cacheDir.empty()) {
+        return {};
+    }
+    return cacheDir + "/rnwhisper_debug_assets";
+}
+
+std::string basenameWithoutQuery(const std::string &path) {
+    std::string basename = path;
+    size_t slash = basename.find_last_of('/');
+    if (slash != std::string::npos) {
+        basename = basename.substr(slash + 1);
+    }
+    size_t query = basename.find('?');
+    if (query != std::string::npos) {
+        basename = basename.substr(0, query);
+    }
+    return basename;
+}
+
+int getResourceIdentifier(JNIEnv *env, const std::string &path) {
+    jobject context = getApplicationContext();
+    if (!context) {
+        return 0;
+    }
+
+    std::vector<std::string> candidates;
+    candidates.push_back(path);
+    candidates.push_back(basenameWithoutQuery(path));
+    std::string basename = basenameWithoutQuery(path);
+    size_t extension = basename.find('.');
+    if (extension != std::string::npos) {
+        candidates.push_back(basename.substr(0, extension));
+    }
+
+    jclass contextClass = env->GetObjectClass(context);
+    jobject resources = env->CallObjectMethod(
+        context,
+        env->GetMethodID(contextClass, "getResources", "()Landroid/content/res/Resources;"));
+    jstring packageName = static_cast<jstring>(env->CallObjectMethod(
+        context,
+        env->GetMethodID(contextClass, "getPackageName", "()Ljava/lang/String;")));
+
+    jclass resourcesClass = env->GetObjectClass(resources);
+    jmethodID identifierMethod = env->GetMethodID(
+        resourcesClass,
+        "getIdentifier",
+        "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)I");
+
+    int identifier = 0;
+    for (const auto &candidate : candidates) {
+      if (candidate.empty()) continue;
+      jstring name = env->NewStringUTF(candidate.c_str());
+      jstring drawable = env->NewStringUTF("drawable");
+      identifier = env->CallIntMethod(resources, identifierMethod, name, drawable, packageName);
+      env->DeleteLocalRef(drawable);
+
+      if (identifier == 0) {
+        jstring raw = env->NewStringUTF("raw");
+        identifier = env->CallIntMethod(resources, identifierMethod, name, raw, packageName);
+        env->DeleteLocalRef(raw);
+      }
+
+      env->DeleteLocalRef(name);
+      if (identifier != 0) {
+        break;
+      }
+    }
+
+    env->DeleteLocalRef(resourcesClass);
+    env->DeleteLocalRef(packageName);
+    env->DeleteLocalRef(resources);
+    env->DeleteLocalRef(contextClass);
+    return identifier;
+}
+
+std::vector<uint8_t> readFileBytes(const std::string &filePath) {
+    std::ifstream stream(filePath, std::ios::binary);
+    if (!stream) {
+        return {};
+    }
+    return std::vector<uint8_t>(
+        std::istreambuf_iterator<char>(stream),
+        std::istreambuf_iterator<char>());
+}
+
+std::vector<uint8_t> readAssetBytes(JNIEnv *env, const std::string &assetPath) {
+    jobject assetManager = getAssetManager();
+    if (!assetManager) {
+        return {};
+    }
+    auto *manager = AAssetManager_fromJava(env, assetManager);
+    AAsset *asset = AAssetManager_open(manager, assetPath.c_str(), AASSET_MODE_STREAMING);
+    if (!asset) {
+        return {};
+    }
+
+    off_t length = AAsset_getLength(asset);
+    std::vector<uint8_t> bytes(static_cast<size_t>(length));
+    if (length > 0) {
+        AAsset_read(asset, bytes.data(), length);
+    }
+    AAsset_close(asset);
+    return bytes;
+}
+
+std::string downloadToCache(
     JNIEnv *env,
-    jobject thiz,
-    jint job_id
-) {
-    UNUSED(thiz);
-    rnwhisper::job *job = rnwhisper::job_get(job_id);
-    if (job) job->abort();
+    const std::string &url,
+    const std::string &relativePath) {
+    std::string cacheRoot = getCacheRoot(env);
+    if (cacheRoot.empty()) {
+        return {};
+    }
+
+    std::string filename = relativePath.empty()
+        ? basenameWithoutQuery(url)
+        : relativePath;
+    if (filename.empty()) {
+        filename = "download.bin";
+    }
+
+    std::filesystem::path target =
+        std::filesystem::path(cacheRoot) / std::filesystem::path(filename);
+    std::filesystem::create_directories(target.parent_path());
+    if (std::filesystem::exists(target)) {
+        return target.string();
+    }
+
+    jclass urlClass = env->FindClass("java/net/URL");
+    jstring urlString = env->NewStringUTF(url.c_str());
+    jobject urlObject = env->NewObject(
+        urlClass,
+        env->GetMethodID(urlClass, "<init>", "(Ljava/lang/String;)V"),
+        urlString);
+    jobject inputStream = env->CallObjectMethod(
+        urlObject,
+        env->GetMethodID(urlClass, "openStream", "()Ljava/io/InputStream;"));
+    env->DeleteLocalRef(urlString);
+
+    std::vector<uint8_t> bytes = readAllBytesFromInputStream(env, inputStream);
+    env->DeleteLocalRef(inputStream);
+    env->DeleteLocalRef(urlObject);
+    env->DeleteLocalRef(urlClass);
+
+    if (bytes.empty()) {
+        return {};
+    }
+
+    std::ofstream output(target, std::ios::binary);
+    output.write(reinterpret_cast<const char *>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    output.close();
+    return target.string();
 }
 
-JNIEXPORT void JNICALL
-Java_com_rnwhisper_WhisperContext_abortAllTranscribe(
+} // namespace
+
+namespace rnwhisper_jsi {
+
+void setAndroidContext(JNIEnv *env, jobject applicationContext, jobject assetManager) {
+    if (!env) {
+        return;
+    }
+    env->GetJavaVM(&g_javaVm);
+
+    if (g_applicationContext) {
+        env->DeleteGlobalRef(g_applicationContext);
+        g_applicationContext = nullptr;
+    }
+    if (g_assetManager) {
+        env->DeleteGlobalRef(g_assetManager);
+        g_assetManager = nullptr;
+    }
+
+    g_applicationContext = env->NewGlobalRef(applicationContext);
+    g_assetManager = env->NewGlobalRef(assetManager);
+}
+
+WhisperContextInitResult hostInitWhisperContext(
+    const WhisperContextInitOptions &options) {
+    WhisperContextInitResult result;
+    bool needsDetach = false;
+    JNIEnv *env = getEnv(&needsDetach);
+    if (!env) {
+        return result;
+    }
+
+    auto params = whisper_context_default_params();
+    params.dtw_token_timestamps = false;
+    params.use_gpu = false;
+    params.flash_attn = options.useFlashAttn;
+    params.use_coreml = false;
+
+    if (options.useGpu) {
+        result.reasonNoGPU = "Currently not supported";
+    }
+
+    std::string modelPath = options.filePath;
+    if (isRemoteUrl(modelPath)) {
+        modelPath = downloadToCache(env, modelPath, "");
+    }
+
+    if (options.isBundleAsset || isAssetPath(modelPath)) {
+        result.context = whisperInitFromAsset(
+            env,
+            getAssetManager(),
+            stripAssetPrefix(modelPath),
+            params);
+    } else {
+        int resourceId = getResourceIdentifier(env, modelPath);
+        if (resourceId != 0) {
+            jobject pushbackStream = openPushbackInputStreamForResource(env, resourceId);
+            if (pushbackStream) {
+                result.context = whisperInitFromInputStream(env, pushbackStream, params);
+                env->DeleteLocalRef(pushbackStream);
+            }
+        } else if (!modelPath.empty()) {
+            result.context =
+                whisper_init_from_file_with_params(modelPath.c_str(), params);
+        }
+    }
+
+    detachThreadIfNeeded(needsDetach);
+    return result;
+}
+
+WhisperVadContextInitResult hostInitWhisperVadContext(
+    const WhisperVadContextInitOptions &options) {
+    WhisperVadContextInitResult result;
+    bool needsDetach = false;
+    JNIEnv *env = getEnv(&needsDetach);
+    if (!env) {
+        return result;
+    }
+
+    auto params = whisper_vad_default_context_params();
+    params.use_gpu = false;
+    if (options.nThreads > 0) {
+        params.n_threads = options.nThreads;
+    }
+    if (options.useGpu) {
+        result.reasonNoGPU = "Currently not supported";
+    }
+
+    std::string modelPath = options.filePath;
+    if (isRemoteUrl(modelPath)) {
+        modelPath = downloadToCache(env, modelPath, "");
+    }
+
+    if (options.isBundleAsset || isAssetPath(modelPath)) {
+        result.context = whisperVadInitFromAsset(
+            env,
+            getAssetManager(),
+            stripAssetPrefix(modelPath),
+            params);
+    } else {
+        int resourceId = getResourceIdentifier(env, modelPath);
+        if (resourceId != 0) {
+            jobject pushbackStream = openPushbackInputStreamForResource(env, resourceId);
+            if (pushbackStream) {
+                result.context = whisperVadInitFromInputStream(env, pushbackStream, params);
+                env->DeleteLocalRef(pushbackStream);
+            }
+        } else if (!modelPath.empty()) {
+            result.context =
+                whisper_vad_init_from_file_with_params(modelPath.c_str(), params);
+        }
+    }
+
+    detachThreadIfNeeded(needsDetach);
+    return result;
+}
+
+std::vector<uint8_t> hostLoadFileBytes(const std::string &path) {
+    bool needsDetach = false;
+    JNIEnv *env = getEnv(&needsDetach);
+    if (!env) {
+        return {};
+    }
+
+    std::string resolvedPath = path;
+    if (isRemoteUrl(resolvedPath)) {
+        resolvedPath = downloadToCache(env, resolvedPath, "");
+    }
+
+    std::vector<uint8_t> bytes;
+    if (isAssetPath(resolvedPath)) {
+        bytes = readAssetBytes(env, stripAssetPrefix(resolvedPath));
+    } else {
+        int resourceId = getResourceIdentifier(env, resolvedPath);
+        if (resourceId != 0) {
+            jobject pushbackStream = openPushbackInputStreamForResource(env, resourceId);
+            if (pushbackStream) {
+                bytes = readAllBytesFromInputStream(env, pushbackStream);
+                env->DeleteLocalRef(pushbackStream);
+            }
+        } else {
+            bytes = readFileBytes(resolvedPath);
+        }
+    }
+
+    detachThreadIfNeeded(needsDetach);
+    return bytes;
+}
+
+void hostClearCache() {
+    bool needsDetach = false;
+    JNIEnv *env = getEnv(&needsDetach);
+    if (!env) {
+        return;
+    }
+    std::string cacheRoot = getCacheRoot(env);
+    if (!cacheRoot.empty()) {
+        std::filesystem::remove_all(cacheRoot);
+    }
+    detachThreadIfNeeded(needsDetach);
+}
+
+} // namespace rnwhisper_jsi
+
+extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *) {
+    g_javaVm = vm;
+    return JNI_VERSION_1_6;
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_rnwhisper_RNWhisperModule_installJSIBindings(
     JNIEnv *env,
-    jobject thiz
-) {
-    UNUSED(thiz);
-    rnwhisper::job_abort_all();
+    jobject,
+    jlong runtimePtr,
+    jobject callInvokerHolder,
+    jobject applicationContext,
+    jobject assetManager) {
+    if (runtimePtr == 0 || callInvokerHolder == nullptr || applicationContext == nullptr || assetManager == nullptr) {
+        return;
+    }
+
+    rnwhisper_jsi::setAndroidContext(env, applicationContext, assetManager);
+
+    auto *runtime = reinterpret_cast<facebook::jsi::Runtime *>(runtimePtr);
+    auto holder = facebook::jni::alias_ref<facebook::react::CallInvokerHolder::javaobject>{
+        reinterpret_cast<facebook::react::CallInvokerHolder::javaobject>(callInvokerHolder)
+    };
+    auto callInvoker = holder->cthis()->getCallInvoker();
+    if (!callInvoker) {
+        return;
+    }
+
+    callInvoker->invokeAsync([runtime, callInvoker]() {
+        rnwhisper_jsi::installJSIBindings(*runtime, callInvoker);
+    });
 }
 
-JNIEXPORT jint JNICALL
-Java_com_rnwhisper_WhisperContext_getTextSegmentCount(
-        JNIEnv *env, jobject thiz, jlong context_ptr) {
-    UNUSED(env);
-    UNUSED(thiz);
-    struct whisper_context *context = reinterpret_cast<struct whisper_context *>(context_ptr);
-    return whisper_full_n_segments(context);
+extern "C" JNIEXPORT void JNICALL
+Java_com_rnwhisper_RNWhisperModule_cleanupJSIBindings(JNIEnv *env, jobject) {
+    rnwhisper_jsi::cleanupJSIBindings();
+    if (g_applicationContext) {
+        env->DeleteGlobalRef(g_applicationContext);
+        g_applicationContext = nullptr;
+    }
+    if (g_assetManager) {
+        env->DeleteGlobalRef(g_assetManager);
+        g_assetManager = nullptr;
+    }
 }
-
-JNIEXPORT jstring JNICALL
-Java_com_rnwhisper_WhisperContext_getTextSegment(
-        JNIEnv *env, jobject thiz, jlong context_ptr, jint index) {
-    UNUSED(thiz);
-    struct whisper_context *context = reinterpret_cast<struct whisper_context *>(context_ptr);
-    const char *text = whisper_full_get_segment_text(context, index);
-    jstring string = env->NewStringUTF(text);
-    return string;
-}
-
-JNIEXPORT jint JNICALL
-Java_com_rnwhisper_WhisperContext_getTextSegmentT0(
-        JNIEnv *env, jobject thiz, jlong context_ptr, jint index) {
-    UNUSED(env);
-    UNUSED(thiz);
-    struct whisper_context *context = reinterpret_cast<struct whisper_context *>(context_ptr);
-    return whisper_full_get_segment_t0(context, index);
-}
-
-JNIEXPORT jint JNICALL
-Java_com_rnwhisper_WhisperContext_getTextSegmentT1(
-        JNIEnv *env, jobject thiz, jlong context_ptr, jint index) {
-    UNUSED(env);
-    UNUSED(thiz);
-    struct whisper_context *context = reinterpret_cast<struct whisper_context *>(context_ptr);
-    return whisper_full_get_segment_t1(context, index);
-}
-
-JNIEXPORT void JNICALL
-Java_com_rnwhisper_WhisperContext_freeContext(
-        JNIEnv *env, jobject thiz, jlong context_ptr) {
-    UNUSED(env);
-    UNUSED(thiz);
-    struct whisper_context *context = reinterpret_cast<struct whisper_context *>(context_ptr);
-    whisper_free(context);
-}
-
-JNIEXPORT jboolean JNICALL
-Java_com_rnwhisper_WhisperContext_getTextSegmentSpeakerTurnNext(
-        JNIEnv *env, jobject thiz, jlong context_ptr, jint index) {
-    UNUSED(env);
-    UNUSED(thiz);
-    struct whisper_context *context = reinterpret_cast<struct whisper_context *>(context_ptr);
-    return whisper_full_get_segment_speaker_turn_next(context, index);
-}
-
-JNIEXPORT jstring JNICALL
-Java_com_rnwhisper_WhisperContext_bench(
-    JNIEnv *env,
-    jobject thiz,
-    jlong context_ptr,
-    jint n_threads
-) {
-    UNUSED(thiz);
-    struct whisper_context *context = reinterpret_cast<struct whisper_context *>(context_ptr);
-    std::string result = rnwhisper::bench(context, n_threads);
-    return env->NewStringUTF(result.c_str());
-}
-
-} // extern "C"

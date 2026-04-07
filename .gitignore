@@ -71,6 +71,18 @@ docs/API/.nojekyll
 *.metallib
 .xocde.env.local
 
+build-arm64/
+build-armeabi-v7a/
+build-x86_64/
+jniLibs/
+build-ios/
+build-tvos/
+
+ios/rnwhisper.xcframework/**/*.framework
+
+local-plan/
+local-plan-done/
+
 # Compiled Typescript files
 src/**/*.js
 example/**/*.js

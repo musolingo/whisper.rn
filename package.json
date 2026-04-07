@@ -38,7 +38,7 @@
   "scripts": {
     "bootstrap": "./scripts/bootstrap.sh",
     "docgen": "typedoc src/index.ts src/realtime-transcription/index.ts --plugin typedoc-plugin-markdown --excludePrivate --readme none --out docs/API",
-    "lint": "eslint \"**/*.{js,ts,tsx}\"",
+    "lint": "ESLINT_USE_FLAT_CONFIG=false eslint \"**/*.{js,ts,tsx}\"",
     "typecheck": "tsc --noEmit",
     "build": "bob build",
     "prepack": "yarn docgen && ./scripts/build-ios.sh && yarn build",

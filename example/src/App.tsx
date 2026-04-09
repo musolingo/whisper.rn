@@ -7,9 +7,22 @@ import {
 import { enableScreens } from 'react-native-screens'
 import { NavigationContainer } from '@react-navigation/native'
 import { createNativeStackNavigator } from '@react-navigation/native-stack'
+import { toggleNativeLog, addNativeLogListener } from '../../src'
 import Transcribe from './Transcribe'
 import TranscribeData from './TranscribeData'
+import Vad from './Vad'
 import Bench from './Bench'
+import RealtimeTranscriber from './RealtimeTranscriber'
+
+// Example: Catch logs from whisper.cpp
+toggleNativeLog(true)
+addNativeLogListener((level, text) => {
+  // eslint-disable-next-line prefer-const
+  let log = (t: string) => t // noop
+  // Uncomment to test:
+  // ;({log} = console)
+  log(['[rnwhisper]', level ? `[${level}]` : '', text].filter(Boolean).join(' '))
+})
 
 enableScreens()
 
@@ -38,13 +51,25 @@ function HomeScreen({ navigation }: { navigation: any }) {
         style={styles.button}
         onPress={() => navigation.navigate('Transcribe')}
       >
-        <Text style={styles.buttonText}>Example: Transcribe File / Realtime</Text>
+        <Text style={styles.buttonText}>Example: Transcribe File</Text>
       </TouchableOpacity>
       <TouchableOpacity
         style={styles.button}
         onPress={() => navigation.navigate('TranscribeData')}
       >
         <Text style={styles.buttonText}>Example: Transcribe Data</Text>
+      </TouchableOpacity>
+      <TouchableOpacity
+        style={styles.button}
+        onPress={() => navigation.navigate('RealtimeTranscriber')}
+      >
+        <Text style={styles.buttonText}>Example: Realtime Transcription</Text>
+      </TouchableOpacity>
+      <TouchableOpacity
+        style={styles.button}
+        onPress={() => navigation.navigate('VAD')}
+      >
+        <Text style={styles.buttonText}>Example: VAD</Text>
       </TouchableOpacity>
       <TouchableOpacity
         style={styles.button}
@@ -66,6 +91,8 @@ function App() {
           <Stack.Screen name="Home" component={HomeScreen} />
           <Stack.Screen name="Transcribe" component={Transcribe} />
           <Stack.Screen name="TranscribeData" component={TranscribeData} />
+          <Stack.Screen name="RealtimeTranscriber" component={RealtimeTranscriber} />
+          <Stack.Screen name="VAD" component={Vad} />
           <Stack.Screen name="Bench" component={Bench} />
         </Stack.Navigator>
       </NavigationContainer>

@@ -2,7 +2,7 @@ require "json"
 
 package = JSON.parse(File.read(File.join(__dir__, "package.json")))
 base_ld_flags = "-framework Accelerate -framework Foundation -framework Metal -framework MetalKit"
-base_compiler_flags = "-DWSP_GGML_USE_CPU -DWSP_GGML_USE_ACCELERATE -Wno-shorten-64-to-32"
+base_compiler_flags = "-DWSP_GGML_USE_CPU -DWSP_GGML_USE_ACCELERATE -pthread -Wno-shorten-64-to-32"
 folly_compiler_flags = "-DFOLLY_NO_CONFIG -DFOLLY_MOBILE=1 -DFOLLY_USE_LIBCPP=1 -Wno-comma"
 
 # Use base_optimizer_flags = "" for debug builds
@@ -28,30 +28,40 @@ Pod::Spec.new do |s|
   s.license      = package["license"]
   s.authors      = package["author"]
 
-  s.platforms    = { :ios => "11.0", :tvos => "11.0" }
+  s.platforms    = { :ios => "13.0", :tvos => "13.0" }
   s.source       = { :git => "https://github.com/mybigday/whisper.rn.git", :tag => "#{s.version}" }
-
-  s.source_files = "ios/**/*.{h,m,mm}", "cpp/*.{h,cpp,c}", "cpp/coreml/*.{h,m,mm}"
-  s.resources = "cpp/*.{metallib}"
 
   s.requires_arc = true
 
-  s.dependency "React-Core"
+  header_search_paths = ['$(inherited)']
+
+  if ENV["RNWHISPER_BUILD_FROM_SOURCE"] == "1"
+    s.source_files = "ios/**/*.{h,m,mm}", "cpp/**/*.{h,cpp,hpp,c,m,mm}"
+    s.public_header_files = "ios/RNWhisper.h", "cpp/whisper.h", "cpp/rn-whisper.h"
+    s.exclude_files = "cpp/ggml-metal/*.m"
+    s.resources = "cpp/ggml-metal/ggml-metal.metal"
+    base_compiler_flags += " -DRNWHISPER_BUILD_FROM_SOURCE"
+    header_search_paths << '"$(PODS_TARGET_SRCROOT)/cpp"'
+
+    s.subspec "no-require-arc" do |ss|
+      ss.requires_arc = false
+      ss.source_files = "cpp/ggml-metal/*.m"
+    end
+  else
+    s.source_files = "ios/**/*.{h,m,mm}", "cpp/jsi/*.{h,cpp}"
+    s.vendored_frameworks = "ios/rnwhisper.xcframework"
+  end
 
   s.compiler_flags = base_compiler_flags
   s.pod_target_xcconfig = {
     "OTHER_LDFLAGS" => base_ld_flags,
     "OTHER_CFLAGS" => base_optimizer_flags,
-    "OTHER_CPLUSPLUSFLAGS" => base_optimizer_flags + " -std=c++17"
+    "OTHER_CPLUSPLUSFLAGS" => base_optimizer_flags + " -std=c++20",
+    "HEADER_SEARCH_PATHS" => header_search_paths.join(" ")
   }
 
-  # Don't install the dependencies when we run `pod install` in the old architecture.
-  if ENV['RCT_NEW_ARCH_ENABLED'] == '1' then
-    install_modules_dependencies(s)
-  end
+  s.dependency "React-callinvoker"
+  s.dependency "React"
 
-  s.subspec "no-require-arc" do |ss|
-    ss.requires_arc = false
-    ss.source_files = "cpp/*.m"
-  end
+  install_modules_dependencies(s)
 end

@@ -708,6 +708,20 @@ struct TranscribeConfig {
     bool tdrzEnable = false;
     JsiFunctionPtr onProgress;
     JsiFunctionPtr onNewSegments;
+
+    // Call inside the worker, after task copies. This config must outlive transcription.
+    whisper_full_params paramsForTranscription() const {
+        auto boundParams = params;
+        if (!prompt.empty()) {
+            boundParams.initial_prompt = prompt.c_str();
+        }
+
+        if (!language.empty()) {
+            boundParams.language = language.c_str();
+        }
+
+        return boundParams;
+    }
 };
 
 TranscribeConfig createTranscribeConfig(
@@ -762,14 +776,7 @@ TranscribeConfig createTranscribeConfig(
     }
 
     config.prompt = getStringProperty(runtime, options, "prompt");
-    if (!config.prompt.empty()) {
-        config.params.initial_prompt = config.prompt.c_str();
-    }
-
     config.language = getStringProperty(runtime, options, "language");
-    if (!config.language.empty()) {
-        config.params.language = config.language.c_str();
-    }
 
     config.params.no_context = true;
     config.params.single_segment = false;
@@ -1661,7 +1668,7 @@ void installJSIBindings(
                         config.params.new_segment_callback_user_data = &segmentsState;
                     }
 
-                    rnwhisper::job *job = rnwhisper::job_new(config.jobId, config.params);
+                    rnwhisper::job *job = rnwhisper::job_new(config.jobId, config.paramsForTranscription());
                     if (job == nullptr) {
                         throw JsiError("Failed to create transcription job");
                     }
@@ -1777,7 +1784,7 @@ void installJSIBindings(
                         config.params.new_segment_callback_user_data = &segmentsState;
                     }
 
-                    rnwhisper::job *job = rnwhisper::job_new(config.jobId, config.params);
+                    rnwhisper::job *job = rnwhisper::job_new(config.jobId, config.paramsForTranscription());
                     if (job == nullptr) {
                         throw JsiError("Failed to create transcription job");
                     }
